@@ -78,6 +78,30 @@ class BuildDefaultAssetsTest(unittest.TestCase):
             self.assertTrue(output.exists())
             self.assertLessEqual(output.stat().st_size, 64 * 1024)
 
+    def test_extra_emoji_is_registered_and_extra_audio_is_packed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            extra = root / "extra"
+            assets = root / "assets"
+            extra.mkdir()
+            assets.mkdir()
+            (extra / "gpt-running.gif").write_bytes(b"GIF89a")
+            (extra / "gpt-running.ogg").write_bytes(b"OggS")
+
+            emojis = BUILD.process_emoji_collection(str(extra), str(assets))
+            extra_files = BUILD.process_extra_files(str(extra), str(assets))
+            BUILD.generate_index_json(str(assets), None, None, emojis, extra_files)
+
+            index = json.loads((assets / "index.json").read_text(encoding="utf-8"))
+            self.assertIn(
+                {"name": "gpt-running", "file": "gpt-running.gif"},
+                index["emoji_collection"],
+            )
+            self.assertEqual(
+                set(index["extra_files"]),
+                {"gpt-running.gif", "gpt-running.ogg"},
+            )
+
     def test_wakenet10_copy_keeps_s3_p1_slice(self):
         with tempfile.TemporaryDirectory() as directory:
             src = Path(directory) / "wn10_nihaoxiaozhi"

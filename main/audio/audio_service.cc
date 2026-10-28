@@ -607,8 +607,18 @@ void AudioService::PushTaskToEncodeQueue(AudioTaskType type, std::vector<int16_t
 }
 
 bool AudioService::PushPacketToDecodeQueue(std::unique_ptr<AudioStreamPacket> packet, bool wait) {
+    return PushPacketToDecodeQueueForGeneration(std::move(packet), wait,
+                                                GetPlaybackGeneration());
+}
+
+uint32_t AudioService::GetPlaybackGeneration() {
+    std::lock_guard<std::mutex> lock(audio_queue_mutex_);
+    return playback_generation_;
+}
+
+bool AudioService::PushPacketToDecodeQueueForGeneration(
+    std::unique_ptr<AudioStreamPacket> packet, bool wait, uint32_t generation) {
     std::unique_lock<std::mutex> lock(audio_queue_mutex_);
-    const uint32_t generation = playback_generation_;
     if (audio_decode_queue_.size() >= MAX_DECODE_PACKETS_IN_QUEUE) {
         if (wait) {
             audio_queue_cv_.wait(lock, [this, generation]() {
@@ -770,16 +780,18 @@ void AudioService::PlaySound(const std::string_view& ogg) {
 
     const auto* buf = reinterpret_cast<const uint8_t*>(ogg.data());
     size_t size = ogg.size();
+    const uint32_t generation = GetPlaybackGeneration();
 
     auto demuxer = std::make_unique<OggDemuxer>();
     demuxer->OnPacket(
-        [this](const uint8_t* data, int sample_rate, int frame_duration_ms, size_t size) {
+        [this, generation](const uint8_t* data, int sample_rate, int frame_duration_ms,
+                           size_t size) {
             auto packet = std::make_unique<AudioStreamPacket>();
             packet->sample_rate = sample_rate;
             packet->frame_duration = frame_duration_ms;
             packet->payload.resize(size);
             std::memcpy(packet->payload.data(), data, size);
-            PushPacketToDecodeQueue(std::move(packet), true);
+            PushPacketToDecodeQueueForGeneration(std::move(packet), true, generation);
         });
     demuxer->Reset();
     demuxer->Process(buf, size);

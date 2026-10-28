@@ -9,12 +9,19 @@
 #include "led/single_led.h"
 #include "assets/lang_config.h"
 #include "power_manager.h"
+#include "codex_status_receiver.h"
+#include "assets.h"
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
 
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
+
+#include <atomic>
+#include <memory>
+#include <string_view>
+#include <utility>
 
 #define TAG "XINGZHI_CUBE_1_54TFT_WIFI"
 
@@ -26,8 +33,127 @@ private:
     SpiLcdDisplay* display_;
     PowerSaveTimer* power_save_timer_;
     PowerManager* power_manager_;
+    std::unique_ptr<CodexStatusReceiver> codex_status_receiver_;
+    std::atomic<bool> codex_running_{false};
+    std::atomic<bool> codex_media_enabled_{false};
+    std::atomic<bool> failure_media_requested_{false};
+    TaskHandle_t codex_audio_task_handle_ = nullptr;
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
+
+    static void CodexAudioTaskEntry(void* arg) {
+        static_cast<XINGZHI_CUBE_1_54TFT_WIFI*>(arg)->CodexAudioTask();
+    }
+
+    void CodexAudioTask() {
+        while (true) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            while (codex_running_.load() && codex_media_enabled_.load()) {
+                void* audio_data = nullptr;
+                size_t audio_size = 0;
+                if (!Assets::GetInstance().GetAssetData("gpt-running.ogg", audio_data,
+                                                        audio_size)) {
+                    ESP_LOGE(TAG, "Asset gpt-running.ogg is unavailable");
+                    vTaskDelay(pdMS_TO_TICKS(1000));
+                    continue;
+                }
+                Application::GetInstance().PlaySound(std::string_view(
+                    static_cast<const char*>(audio_data), audio_size));
+            }
+            if (failure_media_requested_.exchange(false)) {
+                void* audio_data = nullptr;
+                size_t audio_size = 0;
+                if (!Assets::GetInstance().GetAssetData("nailong-failure.ogg", audio_data,
+                                                        audio_size)) {
+                    ESP_LOGE(TAG, "Asset nailong-failure.ogg is unavailable");
+                    continue;
+                }
+                Application::GetInstance().PlaySound(std::string_view(
+                    static_cast<const char*>(audio_data), audio_size));
+                Application::GetInstance().Schedule([this]() {
+                    if (!codex_running_.load() && !failure_media_requested_.load()) {
+                        GetDisplay()->SetStatus("");
+                        GetDisplay()->SetEmotion("neutral");
+                        ESP_LOGI(TAG, "Codex failure media completed");
+                    }
+                });
+            }
+        }
+    }
+
+    void ResumeCodexMedia() {
+        if (!codex_running_.load() || codex_media_enabled_.exchange(true)) {
+            return;
+        }
+        power_save_timer_->WakeUp();
+        GetBacklight()->RestoreBrightness();
+        GetDisplay()->SetStatus("Codex 正在运行");
+        GetDisplay()->SetEmotion("gpt-running");
+        xTaskNotifyGive(codex_audio_task_handle_);
+        ESP_LOGI(TAG, "Codex media resumed");
+    }
+
+    void OnDeviceStateChanged(DeviceState new_state) {
+        auto& application = Application::GetInstance();
+        if (new_state == kDeviceStateListening) {
+            if (codex_media_enabled_.exchange(false)) {
+                application.GetAudioService().ResetDecoder();
+                ESP_LOGI(TAG, "Codex media paused while listening");
+            }
+            return;
+        }
+        ResumeCodexMedia();
+    }
+
+    void OnCodexStatusChanged(bool running, int active_turn_count) {
+        bool previous = codex_running_.exchange(running);
+        ESP_LOGI(TAG, "Codex status: %s (%d active turns)", running ? "RUNNING" : "IDLE",
+                 active_turn_count);
+        if (previous == running) {
+            return;
+        }
+
+        Application::GetInstance().Schedule([this, running]() {
+            auto& application = Application::GetInstance();
+            auto* display = GetDisplay();
+            application.GetAudioService().ResetDecoder();
+            if (running) {
+                codex_media_enabled_.store(false);
+                if (application.GetDeviceState() != kDeviceStateListening) {
+                    ResumeCodexMedia();
+                }
+            } else {
+                codex_media_enabled_.store(false);
+                if (application.GetDeviceState() != kDeviceStateListening) {
+                    display->SetStatus("");
+                    display->SetEmotion("neutral");
+                }
+                ESP_LOGI(TAG, "Codex media paused");
+            }
+        });
+    }
+
+    void OnCodexSummary(int daily_tokens) {
+        Application::GetInstance().Schedule([this, daily_tokens]() {
+            std::string message = "AI已被严肃鞭策\n今日 Token: " + std::to_string(daily_tokens);
+            GetDisplay()->ShowNotification(message, 8000);
+            ESP_LOGI(TAG, "Codex completion summary: daily tokens=%d", daily_tokens);
+        });
+    }
+
+    void OnCodexFailure() {
+        Application::GetInstance().Schedule([this]() {
+            auto& application = Application::GetInstance();
+            application.GetAudioService().ResetDecoder();
+            power_save_timer_->WakeUp();
+            GetBacklight()->RestoreBrightness();
+            GetDisplay()->SetStatus("任务意外中断");
+            GetDisplay()->SetEmotion("nailong-failure");
+            failure_media_requested_.store(true);
+            xTaskNotifyGive(codex_audio_task_handle_);
+            ESP_LOGI(TAG, "Codex failure media started");
+        });
+    }
 
     void InitializePowerManager() {
         power_manager_ = new PowerManager(GPIO_NUM_38);
@@ -161,6 +287,35 @@ public:
         InitializeButtons();
         InitializeSt7789Display();
         GetBacklight()->RestoreBrightness();
+
+        codex_status_receiver_ = std::make_unique<CodexStatusReceiver>(
+            [this](bool running, int active_turn_count) {
+                OnCodexStatusChanged(running, active_turn_count);
+            },
+            [this](int daily_tokens) {
+                OnCodexSummary(daily_tokens);
+            },
+            [this]() {
+                OnCodexFailure();
+            });
+        Application::GetInstance().RegisterSttCallback([this](const std::string& text) {
+            codex_status_receiver_->SendTranscript(text);
+        });
+        Application::GetInstance().RegisterDeviceStateCallback(
+            [this](DeviceState new_state) { OnDeviceStateChanged(new_state); });
+        BaseType_t task_result = xTaskCreate(CodexAudioTaskEntry, "codex_audio", 4096, this, 2,
+                                             &codex_audio_task_handle_);
+        ESP_ERROR_CHECK(task_result == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+    }
+
+    virtual void SetNetworkEventCallback(NetworkEventCallback callback) override {
+        WifiBoard::SetNetworkEventCallback(
+            [this, callback = std::move(callback)](NetworkEvent event, const std::string& data) {
+                if (event == NetworkEvent::Connected) {
+                    codex_status_receiver_->Start();
+                }
+                callback(event, data);
+            });
     }
 
     virtual AudioCodec* GetAudioCodec() override {

@@ -655,13 +655,17 @@ void Application::InitializeProtocol() {
         } else if (strcmp(type->valuestring, "stt") == 0) {
             auto text = cJSON_GetObjectItem(root, "text");
             if (cJSON_IsString(text)) {
+                std::string message(text->valuestring);
+                if (stt_callback_) {
+                    stt_callback_(message);
+                }
                 std::vector<TextGlyph> glyphs;
                 uint8_t bpp = 0;
                 if (!TextGlyphPayload::Parse(root, glyphs, bpp)) {
                     glyphs.clear();
                 }
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
-                Schedule([display, message = std::string(text->valuestring),
+                Schedule([display, message = std::move(message),
                           glyphs = std::move(glyphs), bpp]() {
                     display->AddTextGlyphs(glyphs, bpp);
                     display->SetChatMessage("user", message.c_str());
@@ -1066,6 +1070,10 @@ void Application::HandleStateChangedEvent() {
             // Do nothing
             break;
     }
+
+    if (device_state_callback_) {
+        device_state_callback_(new_state);
+    }
 }
 
 void Application::StartListeningAudio() {
@@ -1316,6 +1324,14 @@ bool Application::CanEnterSleepMode() {
 
 void Application::RegisterMcpBroadcastCallback(std::function<void(const std::string&)> callback) {
     mcp_broadcast_callback_ = std::move(callback);
+}
+
+void Application::RegisterSttCallback(std::function<void(const std::string&)> callback) {
+    stt_callback_ = std::move(callback);
+}
+
+void Application::RegisterDeviceStateCallback(std::function<void(DeviceState)> callback) {
+    device_state_callback_ = std::move(callback);
 }
 
 void Application::SendMcpMessage(const std::string& payload) {

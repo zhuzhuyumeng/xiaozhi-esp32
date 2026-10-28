@@ -218,6 +218,9 @@ private:
     bool InitializeAudioEngine();
     void SetDecodeSampleRate(int sample_rate, int frame_duration);
     void CheckAndUpdateAudioPowerState();
+    uint32_t GetPlaybackGeneration();
+    bool PushPacketToDecodeQueueForGeneration(std::unique_ptr<AudioStreamPacket> packet,
+                                              bool wait, uint32_t generation);
     bool IsPlaybackDrainedLocked() const;
     bool MarkPlaybackDrainedLocked();
 };
